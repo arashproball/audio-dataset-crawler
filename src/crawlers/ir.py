@@ -37,46 +37,41 @@ class IransedaCrawler(BaseCrawler):
 
         page = self.browser.context.new_page()
 
-        audio_requests = {}
-
-        def is_audio_url(request_url):
-            lowered = request_url.lower()
-
-            return (
-                    ".m3u8" in lowered
-                    or ".mp3" in lowered
-                    or ".aac" in lowered
-                    or (
-                            ".mp4" in lowered
-                            and (
-                                    "audio" in lowered
-                                    or "mp4audio" in lowered
-                            )
-                    )
-            )
+        audio_requests = []
 
         def handle_request(request):
-            if is_audio_url(request.url):
-                audio_requests.setdefault(
-                    request.url,
+            request_url = request.url.lower()
+
+            if (
+                    ".m3u8" in request_url
+                    or ".aac" in request_url
+                    or ".mp3" in request_url
+                    or (
+                    ".mp4" in request_url
+                    and (
+                            request.resource_type == "media"
+                            or "audio" in request_url
+                    )
+            )
+            ):
+                audio_requests.append(request.url)
+
+                self.logger.info(
+                    "IranSeda media request detected | "
+                    "type=%s | url=%s",
+                    request.resource_type,
                     request.url
                 )
-
-        def handle_response(response):
-            if is_audio_url(response.url):
-                audio_requests.setdefault(
-                    response.url,
-                    response.url
-                )
-
-        page.on("request", handle_request)
-        page.on("response", handle_response)
 
         try:
             self.logger.info(
                 "IranSeda browser fetch: %s",
                 url
             )
+
+            # مهم:
+            # listener قبل از navigation نصب می‌شود
+            page.on("request", handle_request)
 
             response = page.goto(
                 url,
@@ -108,11 +103,10 @@ class IransedaCrawler(BaseCrawler):
 
             article_count = articles.count()
 
-            if article_count:
-                self.logger.info(
-                    "IranSeda episodes discovered: %s",
-                    article_count
-                )
+            self.logger.info(
+                "IranSeda episodes discovered: %s",
+                article_count
+            )
 
             for index in range(article_count):
 
@@ -148,13 +142,23 @@ class IransedaCrawler(BaseCrawler):
                 )
 
                 if players.count() == 0:
+                    self.logger.warning(
+                        "No SIDPlayer found | content_id=%s",
+                        content_id
+                    )
                     continue
+
+                self.logger.info(
+                    "Activating IranSeda player | content_id=%s",
+                    content_id
+                )
 
                 player = players.first
 
                 before_count = len(audio_requests)
 
                 try:
+
                     player.scroll_into_view_if_needed()
 
                     player.click(
@@ -162,31 +166,38 @@ class IransedaCrawler(BaseCrawler):
                         timeout=5_000
                     )
 
-                    # Give SIDPlayer enough time to create
-                    # the actual media request.
+                    # player ممکن است async باشد
                     page.wait_for_timeout(4_000)
 
                 except Exception as e:
 
-                    self.logger.debug(
-                        "Could not activate IranSeda player "
-                        "content_id=%s: %s",
+                    self.logger.warning(
+                        "Could not activate player | "
+                        "content_id=%s | error=%s",
                         content_id,
                         e
                     )
 
-                captured = list(
-                    audio_requests.values()
-                )
+                    continue
 
-                new_urls = captured[before_count:]
+                new_requests = audio_requests[
+                    before_count:
+                ]
+
+                if not new_requests:
+                    self.logger.warning(
+                        "No media request captured | "
+                        "content_id=%s",
+                        content_id
+                    )
+
+                    continue
 
                 audio_url = self.select_audio_url(
-                    new_urls
+                    new_requests
                 )
 
                 if audio_url:
-
                     self.audio_urls[
                         content_id
                     ] = audio_url
@@ -196,14 +207,6 @@ class IransedaCrawler(BaseCrawler):
                         "content_id=%s | audio_url=%s",
                         content_id,
                         audio_url
-                    )
-
-                else:
-
-                    self.logger.warning(
-                        "IranSeda audio URL not captured | "
-                        "content_id=%s",
-                        content_id
                     )
 
             return {
@@ -217,7 +220,8 @@ class IransedaCrawler(BaseCrawler):
         except Exception as e:
 
             self.logger.error(
-                "IranSeda browser fetch failed for %s: %s",
+                "IranSeda browser fetch failed | "
+                "url=%s | error=%s",
                 url,
                 e
             )
@@ -231,12 +235,7 @@ class IransedaCrawler(BaseCrawler):
                 handle_request
             )
 
-            page.remove_listener(
-                "response",
-                handle_response
-            )
-
-            page.close()    # Main parser
+            page.close()
     # ---------------------------------------------------------
     @staticmethod
     def select_audio_url(urls):
