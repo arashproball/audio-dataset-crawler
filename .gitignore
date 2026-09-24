@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+
+state/
+*.log
+
+khamenei.json
+
+vaezin.json
