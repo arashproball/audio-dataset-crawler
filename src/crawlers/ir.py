@@ -1,67 +1,61 @@
+import json
 import re
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import jdatetime
+from bs4 import BeautifulSoup
 
-from crawlers.base_crawler import (
-    BaseCrawler,
-    AudioItem,
-)
+from crawlers.base_crawler import BaseCrawler, AudioItem
 
 
 class IransedaCrawler(BaseCrawler):
 
+    API_BASE_URL = "http://api.iranseda.ir"
     WEB_BASE_URL = "http://podcast.iranseda.ir"
 
-    def __init__(
-        self,
-        start_url,
-        **kwargs
-    ):
+    def __init__(self, start_url, **kwargs):
         super().__init__(
             start_url=start_url,
             **kwargs
         )
 
         self.items: list[AudioItem] = []
-        self.audio_urls = {}
 
-    # ---------------------------------------------------------
-    # Browser-only fetch
-    # ---------------------------------------------------------
+    # =========================================================
+    # BROWSER FETCH
+    # =========================================================
 
     def fetch(self, url):
         if self.browser is None:
+            self.logger.error(
+                "Browser is required for IranSeda crawler."
+            )
             return None
 
-        page = self.browser.context.new_page()
+        # -----------------------------------------------------
+        # The homepage's HTML is an almost-empty SPA shell
+        # (<div id="app"></div> + <script src="assets/js/app.js">).
+        # BrowserFetcher.fetch() reads page.content() right after
+        # "domcontentloaded", which fires before app.js has made
+        # or resolved any request - so that shell, not the grid,
+        # is what we'd get here every time, retried or not.
+        #
+        # app.js itself builds the grid from a JSON endpoint:
+        # http://api.iranseda.ir/podcast/vitrin/ (confirmed by
+        # capturing the page's own XHR/fetch calls). Its
+        # Containers[].boxes[] shape is identical to
+        # podcastepisodes, right down to the WebUrl/URL fields -
+        # so for listing pages (is_target_path() False - in this
+        # crawler's config, just the homepage), we discover
+        # programs straight from that endpoint instead of the
+        # DOM. extract_links() still runs afterwards (base_crawler
+        # calls it unconditionally) but finds nothing new in the
+        # shell below, which is fine - discovery already happened.
+        # -----------------------------------------------------
 
-        audio_requests = []
-
-        def handle_request(request):
-            request_url = request.url.lower()
-
-            if (
-                    ".m3u8" in request_url
-                    or ".aac" in request_url
-                    or ".mp3" in request_url
-                    or (
-                    ".mp4" in request_url
-                    and (
-                            request.resource_type == "media"
-                            or "audio" in request_url
-                    )
-            )
-            ):
-                audio_requests.append(request.url)
-
-                self.logger.info(
-                    "IranSeda media request detected | "
-                    "type=%s | url=%s",
-                    request.resource_type,
-                    request.url
-                )
+        if not self.is_target_path(url):
+            self.discover_from_vitrin()
 
         try:
             self.logger.info(
@@ -69,342 +63,599 @@ class IransedaCrawler(BaseCrawler):
                 url
             )
 
-            # مهم:
-            # listener قبل از navigation نصب می‌شود
-            page.on("request", handle_request)
+            result = self.browser.fetch(url)
 
-            response = page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=self.browser.timeout
-            )
-
-            if response is None:
+            if result is None:
                 return None
 
-            try:
-                page.wait_for_selector(
-                    "article.podcasthome",
-                    timeout=10_000
-                )
-
-                self.logger.info(
-                    "IranSeda episode DOM detected"
-                )
-
-            except Exception:
-                self.logger.warning(
-                    "IranSeda episode DOM was not detected"
-                )
-
-            articles = page.locator(
-                "article.podcasthome"
-            )
-
-            article_count = articles.count()
-
-            self.logger.info(
-                "IranSeda episodes discovered: %s",
-                article_count
-            )
-
-            for index in range(article_count):
-
-                article = articles.nth(index)
-
-                content_id = article.get_attribute(
-                    "data-id"
-                )
-
-                if not content_id:
-
-                    article_id = article.get_attribute(
-                        "id"
-                    )
-
-                    if article_id:
-
-                        match = re.search(
-                            r"\d+",
-                            article_id
-                        )
-
-                        if match:
-                            content_id = match.group()
-
-                if not content_id:
-                    continue
-
-                content_id = int(content_id)
-
-                players = article.locator(
-                    '[onclick*="SIDPlayer"]'
-                )
-
-                if players.count() == 0:
-                    self.logger.warning(
-                        "No SIDPlayer found | content_id=%s",
-                        content_id
-                    )
-                    continue
-
-                self.logger.info(
-                    "Activating IranSeda player | content_id=%s",
-                    content_id
-                )
-
-                player = players.first
-
-                before_count = len(audio_requests)
-
-                try:
-
-                    player.scroll_into_view_if_needed()
-
-                    player.click(
-                        force=True,
-                        timeout=5_000
-                    )
-
-                    # player ممکن است async باشد
-                    page.wait_for_timeout(4_000)
-
-                except Exception as e:
-
-                    self.logger.warning(
-                        "Could not activate player | "
-                        "content_id=%s | error=%s",
-                        content_id,
-                        e
-                    )
-
-                    continue
-
-                new_requests = audio_requests[
-                    before_count:
-                ]
-
-                if not new_requests:
-                    self.logger.warning(
-                        "No media request captured | "
-                        "content_id=%s",
-                        content_id
-                    )
-
-                    continue
-
-                audio_url = self.select_audio_url(
-                    new_requests
-                )
-
-                if audio_url:
-                    self.audio_urls[
-                        content_id
-                    ] = audio_url
-
-                    self.logger.info(
-                        "IranSeda audio captured | "
-                        "content_id=%s | audio_url=%s",
-                        content_id,
-                        audio_url
-                    )
-
             return {
-                "url": page.url,
-                "status": response.status,
-                "content": page.content(),
-                "headers": response.headers,
-                "method": "playwright"
+                "url": result["url"],
+                "status": result["status"],
+                "content": result["content"],
+                "headers": result["headers"],
+                "method": "playwright",
             }
 
-        except Exception as e:
-
+        except Exception as exc:
             self.logger.error(
                 "IranSeda browser fetch failed | "
                 "url=%s | error=%s",
                 url,
-                e
+                exc,
             )
-
             return None
 
-        finally:
+    # =========================================================
+    # VITRIN DISCOVERY (homepage grid, via its JSON endpoint)
+    # =========================================================
 
-            page.remove_listener(
-                "request",
-                handle_request
+    def discover_from_vitrin(self):
+
+        url = f"{self.API_BASE_URL}/podcast/vitrin/"
+
+        data = self.fetch_json(url)
+
+        if data is None:
+            self.logger.error(
+                "Failed to fetch IranSeda vitrin listing | "
+                "url=%s",
+                url,
+            )
+            return
+
+        # vitrin's Containers[].boxes[] shape - and the
+        # WebUrl/URL fields on each box - are identical to
+        # podcastepisodes, so the same helpers apply here.
+
+        boxes = self.extract_episode_boxes(data)
+
+        discovered = 0
+
+        for box in boxes:
+
+            program_url = self.extract_content_url(box)
+
+            if not program_url:
+                continue
+
+            before = len(self.queued_urls)
+
+            self.add_url(program_url)
+
+            if len(self.queued_urls) > before:
+                discovered += 1
+
+        self.logger.info(
+            "IranSeda vitrin discovery completed | "
+            "url=%s | discovered=%s",
+            url,
+            discovered,
+        )
+
+    # =========================================================
+    # LINK DISCOVERY
+    # =========================================================
+
+    def extract_links(self, soup, current_url):
+        discovered = 0
+
+        # -----------------------------------------------------
+        # 1. Normal podcasthome links
+        # -----------------------------------------------------
+
+        for link in soup.select("a[href]"):
+
+            href = link.get("href")
+
+            if not href:
+                continue
+
+            full_url = urljoin(
+                current_url,
+                href
             )
 
-            page.close()
-    # ---------------------------------------------------------
-    @staticmethod
-    def select_audio_url(urls):
-        if not urls:
-            return None
+            parsed = urlparse(full_url)
 
-        # Prefer the playlist because it is the stable
-        # media entry point rather than an individual segment.
-        for url in urls:
-            if ".m3u8" in url.lower():
-                return url
+            if parsed.scheme not in ("http", "https"):
+                continue
 
-        for extension in (".mp3", ".mp4", ".aac"):
-            for url in urls:
-                if extension in url.lower():
-                    return url
+            if not self.is_same_domain(full_url):
+                continue
 
-        return urls[0]
+            path = parsed.path.rstrip("/")
 
+            if path != "/podcasthome":
+                continue
+
+            before = len(self.queued_urls)
+
+            self.add_url(full_url)
+
+            if len(self.queued_urls) > before:
+                discovered += 1
+
+        # -----------------------------------------------------
+        # 2. SIDPlayer(serial_id, item_id)
+        # -----------------------------------------------------
+
+        for element in soup.select(
+            "[onclick*='SIDPlayer']"
+        ):
+
+            onclick = element.get(
+                "onclick",
+                ""
+            )
+
+            match = re.search(
+                r"SIDPlayer\(\s*(\d+)\s*,\s*(\d+)\s*\)",
+                onclick
+            )
+
+            if match is None:
+                continue
+
+            serial_id = match.group(1)
+
+            program_url = (
+                f"{self.WEB_BASE_URL}"
+                f"/podcasthome/"
+                f"?p={serial_id}"
+            )
+
+            before = len(self.queued_urls)
+
+            self.add_url(program_url)
+
+            if len(self.queued_urls) > before:
+                discovered += 1
+
+        # -----------------------------------------------------
+        # 3. data-id + podcasthome context
+        # -----------------------------------------------------
+
+        for element in soup.select(
+            "[data-id]"
+        ):
+
+            data_id = element.get("data-id")
+
+            if not data_id:
+                continue
+
+            parent = element.find_parent(
+                "article"
+            )
+
+            if parent is None:
+                continue
+
+            if "podcasthome" not in (
+                parent.get("class") or []
+            ):
+                continue
+
+            # The program/serial id is normally available
+            # from SIDPlayer in the same article.
+            onclick_elements = parent.select(
+                "[onclick*='SIDPlayer']"
+            )
+
+            for player in onclick_elements:
+
+                onclick = player.get(
+                    "onclick",
+                    ""
+                )
+
+                match = re.search(
+                    r"SIDPlayer\(\s*(\d+)\s*,\s*(\d+)\s*\)",
+                    onclick
+                )
+
+                if match is None:
+                    continue
+
+                serial_id = match.group(1)
+
+                program_url = (
+                    f"{self.WEB_BASE_URL}"
+                    f"/podcasthome/"
+                    f"?p={serial_id}"
+                )
+
+                before = len(
+                    self.queued_urls
+                )
+
+                self.add_url(
+                    program_url
+                )
+
+                if len(
+                    self.queued_urls
+                ) > before:
+                    discovered += 1
+
+                break
+
+        self.logger.info(
+            "IranSeda link discovery completed | "
+            "url=%s | discovered=%s",
+            current_url,
+            discovered,
+        )
+
+    # =========================================================
+    # PARSE
+    # =========================================================
 
     def parse(
         self,
         response,
-        soup
+        soup: BeautifulSoup
     ):
 
-        self.logger.info(
-            "Parsing rendered IranSeda DOM: %s",
+        program_id = self.extract_program_id(
             response["url"]
         )
 
-        articles = self.find_episode_articles(
-            soup
-        )
-
-        if not articles:
-
-            self.logger.warning(
-                "No IranSeda episode articles found: %s",
+        if program_id is None:
+            self.logger.debug(
+                "No IranSeda program id found | url=%s",
                 response["url"]
             )
-
             return
 
         self.logger.info(
-            "IranSeda episodes discovered: %s",
-            len(articles)
+            "IranSeda program found | program_id=%s",
+            program_id
         )
 
-        program_title = self.extract_program_title(
-            soup
+        program = self.fetch_program(
+            program_id
         )
+
+        if program is None:
+            return
 
         speaker = self.extract_speaker(
-            soup
+            program
         )
 
-        for article in articles:
+        page_number = 1
 
-            item = self.parse_episode(
-                article=article,
-                page_url=response["url"],
-                program_title=program_title,
-                speaker=speaker
-            )
-
-            if item is None:
-                continue
-
-            self.items.append(
-                item
-            )
+        while page_number <= self.max_page:
 
             self.logger.info(
-                "IranSeda audio extracted | "
-                f"content_id={item.content_id} | "
-                f"audio_title={item.audio_title}"
+                "Fetching IranSeda episodes | "
+                "program_id=%s | page=%s",
+                program_id,
+                page_number,
             )
 
-    # ---------------------------------------------------------
-    # Episode discovery
-    # ---------------------------------------------------------
+            episodes = self.fetch_episodes(
+                program_id,
+                page_number
+            )
+
+            if episodes is None:
+                break
+
+            boxes = self.extract_episode_boxes(
+                episodes
+            )
+
+            if not boxes:
+                self.logger.debug(
+                    "No IranSeda episodes found | "
+                    "program_id=%s | page=%s",
+                    program_id,
+                    page_number,
+                )
+                break
+
+            for episode in boxes:
+
+                item = self.parse_episode(
+                    episode=episode,
+                    program=program,
+                    speaker=speaker,
+                )
+
+                if item is None:
+                    continue
+
+                self.items.append(item)
+
+                self.logger.info(
+                    "IranSeda audio extracted | "
+                    "content_id=%s | audio_title=%s",
+                    item.content_id,
+                    item.audio_title,
+                )
+
+            if not self.has_next_page(
+                episodes,
+                page_number
+            ):
+                break
+
+            page_number += 1
+
+    # =========================================================
+    # PROGRAM
+    # =========================================================
 
     @staticmethod
-    def find_episode_articles(soup):
+    def extract_program_id(url):
 
-        selectors = [
-            "article.podcasthome",
-            "article[id^='item']",
-        ]
+        query = parse_qs(
+            urlparse(url).query
+        )
 
-        for selector in selectors:
+        values = query.get("p")
 
-            articles = soup.select(
-                selector
+        if not values:
+            return None
+
+        try:
+            return int(values[0])
+
+        except (TypeError, ValueError):
+            return None
+
+    def fetch_program(self, program_id):
+
+        url = (
+            f"{self.API_BASE_URL}"
+            f"/podcast/podcasthome/"
+            f"?p={program_id}"
+        )
+
+        program = self.fetch_json(url)
+
+        if program is None:
+            self.logger.error(
+                "Failed to fetch IranSeda program via "
+                "API and browser fallback | url=%s",
+                url,
             )
 
-            if articles:
-                return articles
+        return program
 
-        return []
+    # =========================================================
+    # EPISODES
+    # =========================================================
 
-    # ---------------------------------------------------------
-    # Parse one episode
-    # ---------------------------------------------------------
+    def fetch_episodes(
+        self,
+        program_id,
+        page_number
+    ):
+
+        url = (
+            f"{self.API_BASE_URL}"
+            f"/podcast/podcastepisodes/"
+            f"?p={program_id}"
+            f"&pn={page_number}"
+            f"&sf=0"
+        )
+
+        episodes = self.fetch_json(url)
+
+        if episodes is None:
+            self.logger.error(
+                "Failed to fetch IranSeda episodes via "
+                "API and browser fallback | url=%s",
+                url,
+            )
+
+        return episodes
+
+    # =========================================================
+    # JSON FETCH: API first, browser fetch as a fallback
+    # =========================================================
+    #
+    # fetch_program()/fetch_episodes() both need the same JSON
+    # the api.iranseda.ir endpoints return. Calling that API
+    # directly (fetch_json_via_api) is cheap and is tried first;
+    # if it fails - a block on this host/IP, a timeout, a bad
+    # response - the exact same URL is retried through the real
+    # browser (fetch_json_via_browser), which presents as a
+    # normal browser session and can succeed where a plain
+    # request doesn't. This mirrors the HTTP-then-browser
+    # fallback BaseCrawler.fetch() already uses for pages.
+    # =========================================================
+
+    def fetch_json(self, url):
+
+        data = self.fetch_json_via_api(url)
+
+        if data is not None:
+            return data
+
+        if self.browser is None:
+            return None
+
+        self.logger.info(
+            "IranSeda API call failed, retrying "
+            "via browser: %s",
+            url,
+        )
+
+        return self.fetch_json_via_browser(url)
+
+    def fetch_json_via_api(self, url):
+
+        try:
+
+            response = self.session.get(
+                url,
+                timeout=self.timeout,
+            )
+
+            response.raise_for_status()
+
+            return response.json()
+
+        except Exception as exc:
+
+            self.logger.warning(
+                "IranSeda API request failed | "
+                "url=%s | error=%s",
+                url,
+                exc,
+            )
+
+            return None
+
+    def fetch_json_via_browser(self, url):
+
+        try:
+
+            result = self.browser.fetch(url)
+
+        except Exception as exc:
+
+            self.logger.error(
+                "IranSeda browser fetch (API fallback) "
+                "failed | url=%s | error=%s",
+                url,
+                exc,
+            )
+
+            return None
+
+        if result is None or not result.get("content"):
+            return None
+
+        return self.parse_json_content(
+            result["content"],
+            url,
+        )
+
+    def parse_json_content(self, content, url):
+
+        if isinstance(content, bytes):
+            text = content.decode(
+                "utf-8",
+                errors="replace",
+            )
+        else:
+            text = content
+
+        try:
+            return json.loads(text)
+
+        except (TypeError, ValueError):
+            pass
+
+        # A browser will sometimes wrap a raw JSON response in
+        # a minimal HTML document (e.g. inside a <pre> tag).
+        # Pull the text back out before giving up on it.
+
+        try:
+
+            soup = BeautifulSoup(
+                text,
+                "html.parser"
+            )
+
+            pre = soup.find("pre")
+
+            raw = pre.get_text() if pre else soup.get_text()
+
+            return json.loads(raw)
+
+        except (TypeError, ValueError, AttributeError):
+
+            self.logger.error(
+                "Could not parse JSON from browser "
+                "content | url=%s",
+                url,
+            )
+
+            return None
+
+    @staticmethod
+    def extract_episode_boxes(episodes):
+
+        containers = episodes.get(
+            "Containers",
+            []
+        )
+
+        boxes = []
+
+        for container in containers:
+
+            boxes.extend(
+                container.get(
+                    "boxes",
+                    []
+                )
+            )
+
+        return boxes
+
+    # =========================================================
+    # EPISODE PARSING
+    # =========================================================
 
     def parse_episode(
         self,
-        article,
-        page_url,
-        program_title,
+        episode,
+        program,
         speaker
     ):
 
-        content_id = self.extract_content_id(
-            article
+        audio_url = self.extract_audio_url(
+            episode
         )
-
-        if content_id is None:
-
-            self.logger.debug(
-                "Episode without content id"
-            )
-
-            return None
-
-        content_url = self.extract_content_url(
-            article
-        )
-
-        if content_url is None:
-
-            self.logger.debug(
-                "Episode without content URL | "
-                f"content_id={content_id}"
-            )
-
-            return None
-
-        audio_url = self.audio_urls.get(content_id)
 
         if audio_url is None:
-            self.logger.warning(
-                "IranSeda audio URL not captured | "
-                "content_id=%s",
-                content_id
+
+            self.logger.debug(
+                "No audio URL found in IranSeda episode."
             )
+
             return None
 
+        content_id = self.extract_content_id(
+            episode
+        )
+
+        title = self.extract_title(
+            program
+        )
+
         audio_title = self.extract_audio_title(
-            article
+            episode
+        )
+
+        content_url = self.extract_content_url(
+            episode
         )
 
         published_at = self.extract_date(
-            article
+            episode
         )
 
         image_url = self.extract_image_url(
-            article
+            episode
         )
 
-        self.add_url(
-            content_url
-        )
+        if content_url:
+            self.add_url(
+                content_url
+            )
 
         return AudioItem(
             source="iranseda.ir",
             content_id=content_id,
-            title=program_title,
+            title=title,
             content_url=content_url,
             audio_url=audio_url,
             published_at=published_at,
@@ -415,281 +666,65 @@ class IransedaCrawler(BaseCrawler):
             audio_title=audio_title,
         )
 
-    # ---------------------------------------------------------
-    # Content ID
-    # ---------------------------------------------------------
+    # =========================================================
+    # CONTENT ID
+    # =========================================================
 
     @staticmethod
-    def extract_content_id(article):
+    def extract_content_id(episode):
 
-        element = article.select_one(
-            "[data-id]"
+        value = episode.get(
+            "ItemID"
         )
 
-        if element is not None:
-
-            value = element.get(
-                "data-id"
-            )
-
-            try:
-
-                return int(value)
-
-            except (
-                TypeError,
-                ValueError
-            ):
-                pass
-
-        article_id = article.get(
-            "id"
-        )
-
-        if article_id:
-
-            match = re.search(
-                r"(\d+)",
-                article_id
-            )
-
-            if match:
-
-                return int(
-                    match.group(1)
-                )
-
-        link = article.select_one(
-            "a.modallink[href]"
-        )
-
-        if link is not None:
-
-            href = link.get(
-                "href"
-            )
-
-            if href:
-
-                parsed = urlparse(
-                    href
-                )
-
-                query = dict(
-                    [
-                        part.split("=", 1)
-                        for part in parsed.query.split("&")
-                        if "=" in part
-                    ]
-                )
-
-                value = query.get(
-                    "g"
-                )
-
-                if value:
-
-                    try:
-
-                        return int(value)
-
-                    except (
-                        TypeError,
-                        ValueError
-                    ):
-                        pass
-
-        return None
-
-    # ---------------------------------------------------------
-    # Content URL
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def extract_content_url(article):
-
-        link = article.select_one(
-            "a.modallink[href]"
-        )
-
-        if link is None:
+        if value is None:
             return None
 
-        href = link.get(
-            "href"
-        )
+        try:
+            return int(value)
 
-        if not href:
+        except (TypeError, ValueError):
             return None
 
-        return urljoin(
-            IransedaCrawler.WEB_BASE_URL,
-            href
-        )
-
-    # ---------------------------------------------------------
-    # Audio URL
-    # ---------------------------------------------------------
+    # =========================================================
+    # TITLE
+    # =========================================================
 
     @staticmethod
-    def extract_audio_url(article):
+    def extract_title(program):
 
-        # 1. Direct audio element
-        audio = article.select_one(
-            "audio[src]"
+        value = program.get(
+            "serialName"
         )
 
-        if audio is not None:
+        if not value:
+            return None
 
-            src = audio.get(
-                "src"
-            )
+        return value.strip()
 
-            if src:
-                return urljoin(
-                    IransedaCrawler.WEB_BASE_URL,
-                    src
-                )
-
-        # 2. Source element
-        source = article.select_one(
-            "audio source[src]"
-        )
-
-        if source is not None:
-
-            src = source.get(
-                "src"
-            )
-
-            if src:
-                return urljoin(
-                    IransedaCrawler.WEB_BASE_URL,
-                    src
-                )
-
-        # 3. MP3 / MP4 / M3U8 links
-        for link in article.select(
-            "a[href]"
-        ):
-
-            href = link.get(
-                "href"
-            )
-
-            if not href:
-                continue
-
-            lowered = href.lower()
-
-            if (
-                ".mp3" in lowered
-                or ".mp4" in lowered
-                or ".m3u8" in lowered
-                or "playurl" in lowered
-                or "playlist" in lowered
-            ):
-
-                return urljoin(
-                    IransedaCrawler.WEB_BASE_URL,
-                    href
-                )
-
-        # 4. Data attributes
-        attributes = [
-            "data-src",
-            "data-url",
-            "data-playurl",
-            "data-audio",
-            "data-audio-url",
-        ]
-
-        for attribute in attributes:
-
-            element = article.select_one(
-                f"[{attribute}]"
-            )
-
-            if element is None:
-                continue
-
-            value = element.get(
-                attribute
-            )
-
-            if not value:
-                continue
-
-            lowered = value.lower()
-
-            if (
-                ".mp3" in lowered
-                or ".mp4" in lowered
-                or ".m3u8" in lowered
-                or "playlist" in lowered
-            ):
-
-                return value
-
-        # 5. onclick / SIDPlayer fallback
-        for element in article.select(
-            "[onclick]"
-        ):
-
-            onclick = element.get(
-                "onclick"
-            )
-
-            if not onclick:
-                continue
-
-            if "SIDPlayer" not in onclick:
-                continue
-
-            # SIDPlayer itself does not contain the
-            # audio URL, so do not invent one.
-            # The URL must be obtained from rendered DOM.
-            continue
-
-        return None
-
-    # ---------------------------------------------------------
-    # Audio title
-    # ---------------------------------------------------------
+    # =========================================================
+    # AUDIO TITLE
+    # =========================================================
 
     @staticmethod
-    def extract_audio_title(article):
+    def extract_audio_title(episode):
 
-        title_element = article.select_one(
-            ".card-title"
+        title = episode.get(
+            "title"
         )
 
-        description_element = article.select_one(
-            ".text-content"
+        description = episode.get(
+            "webdesc"
         )
 
-        title = None
-        description = None
+        if isinstance(title, str):
+            title = title.strip()
 
-        if title_element is not None:
-
-            title = title_element.get_text(
-                " ",
-                strip=True
-            )
-
-        if description_element is not None:
-
-            description = description_element.get_text(
-                " ",
-                strip=True
-            )
+        if isinstance(description, str):
+            description = description.strip()
 
         if title and description:
-
-            return (
-                f"{title} | {description}"
-            )
+            return f"{title} | {description}"
 
         if title:
             return title
@@ -699,148 +734,110 @@ class IransedaCrawler(BaseCrawler):
 
         return None
 
-    # ---------------------------------------------------------
-    # Program title
-    # ---------------------------------------------------------
+    # =========================================================
+    # CONTENT URL
+    # =========================================================
 
-    @staticmethod
-    def extract_program_title(soup):
+    @classmethod
+    def extract_content_url(cls, episode):
 
-        json_ld = soup.select_one(
-            'script[type="application/ld+json"]'
+        web_url = episode.get(
+            "WebUrl"
         )
 
-        if json_ld is not None:
+        if web_url:
 
-            text = json_ld.string
+            return urljoin(
+                cls.WEB_BASE_URL,
+                web_url
+            )
 
-            if text:
+        return episode.get(
+            "URL"
+        )
 
-                match = re.search(
-                    r'"name"\s*:\s*"([^"]+)"',
-                    text
+    # =========================================================
+    # AUDIO URL
+    # =========================================================
+
+    @staticmethod
+    def extract_audio_url(episode):
+
+        audio_url = episode.get(
+            "playurl"
+        )
+
+        if audio_url:
+            return audio_url
+
+        items = episode.get(
+            "items",
+            []
+        )
+
+        for item in items:
+
+            audio_url = item.get(
+                "playUrl"
+            )
+
+            if audio_url:
+                return audio_url
+
+        return None
+
+    # =========================================================
+    # SPEAKER
+    # =========================================================
+
+    @staticmethod
+    def extract_speaker(program):
+
+        main_tags = program.get(
+            "mainTags",
+            []
+        )
+
+        for tag in main_tags:
+
+            if tag.get(
+                "tagname"
+            ) == "میزبان/مجری":
+
+                value = tag.get(
+                    "tagvalue"
                 )
 
-                if match:
+                if value:
+                    return value.strip()
 
-                    value = match.group(
-                        1
-                    ).strip()
+        return None
 
-                    if value:
-                        return value
+    # =========================================================
+    # DATE
+    # =========================================================
 
-        heading = soup.select_one(
-            "h1"
+    @staticmethod
+    def extract_date(episode):
+
+        tags = episode.get(
+            "tags",
+            []
         )
 
-        if heading is not None:
+        for tag in tags:
 
-            value = heading.get_text(
-                " ",
-                strip=True
+            value = tag.get(
+                "tagvalue"
             )
 
             if value:
-                return value
 
-        return None
-
-    # ---------------------------------------------------------
-    # Speaker
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def extract_speaker(soup):
-
-        selectors = [
-            "[class*='host']",
-            "[class*='speaker']",
-            "[class*='mojri']",
-        ]
-
-        for selector in selectors:
-
-            element = soup.select_one(
-                selector
-            )
-
-            if element is None:
-                continue
-
-            value = element.get_text(
-                " ",
-                strip=True
-            )
-
-            if value:
-                return value
-
-        return None
-
-    # ---------------------------------------------------------
-    # Published date
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def extract_date(article):
-
-        selectors = [
-            "time",
-            "[class*='date']",
-            "[class*='tarikh']",
-        ]
-
-        for selector in selectors:
-
-            element = article.select_one(
-                selector
-            )
-
-            if element is None:
-                continue
-
-            value = element.get_text(
-                " ",
-                strip=True
-            )
-
-            if not value:
-                continue
-
-            normalized = (
-                IransedaCrawler.normalize_date(
+                return IransedaCrawler.normalize_date(
                     value
                 )
-            )
-
-            if normalized:
-                return normalized
-
-        # Search all visible text for Jalali date
-        text = article.get_text(
-            " ",
-            strip=True
-        )
-
-        match = re.search(
-            r"((?:13|14)\d{2}/\d{1,2}/\d{1,2})",
-            text
-        )
-
-        if match:
-
-            return (
-                IransedaCrawler.normalize_date(
-                    match.group(1)
-                )
-            )
 
         return None
-
-    # ---------------------------------------------------------
-    # Jalali -> Gregorian
-    # ---------------------------------------------------------
 
     @staticmethod
     def normalize_date(value):
@@ -857,8 +854,8 @@ class IransedaCrawler(BaseCrawler):
             )
         )
 
-        match = re.search(
-            r"((?:13|14)\d{2})/(\d{1,2})/(\d{1,2})",
+        match = re.fullmatch(
+            r"(\d{4})/(\d{1,2})/(\d{1,2})",
             value
         )
 
@@ -885,38 +882,74 @@ class IransedaCrawler(BaseCrawler):
                 day
             )
 
-            return (
-                date
-                .togregorian()
-                .isoformat()
-            )
+            return date.togregorian().isoformat()
 
         except ValueError:
-
             return None
 
-    # ---------------------------------------------------------
-    # Image
-    # ---------------------------------------------------------
+    # =========================================================
+    # IMAGE
+    # =========================================================
 
     @staticmethod
-    def extract_image_url(article):
+    def extract_image_url(episode):
 
-        image = article.select_one(
-            "img[src]"
+        image_url = episode.get(
+            "image"
         )
 
-        if image is None:
-            return None
+        if image_url:
+            return image_url
 
-        src = image.get(
-            "src"
+        return episode.get(
+            "image-cover"
         )
 
-        if not src:
-            return None
+    # =========================================================
+    # PAGINATION
+    # =========================================================
 
-        return urljoin(
-            IransedaCrawler.WEB_BASE_URL,
-            src
+    @staticmethod
+    def has_next_page(
+        episodes,
+        current_page
+    ):
+
+        if str(
+            episodes.get("Infinity")
+        ).lower() != "true":
+
+            return False
+
+        try:
+
+            page_number = int(
+                episodes.get(
+                    "PageNo",
+                    current_page
+                )
+            )
+
+        except (TypeError, ValueError):
+
+            return False
+
+        if page_number != current_page:
+            return False
+
+        containers = episodes.get(
+            "Containers",
+            []
         )
+
+        count = sum(
+            len(
+                container.get(
+                    "boxes",
+                    []
+                )
+            )
+            for container in containers
+        )
+
+        return count > 0
